@@ -14,6 +14,7 @@ import logging
 import os
 import subprocess
 import tempfile
+import time
 
 from google.cloud import texttospeech
 
@@ -26,6 +27,50 @@ try:
 except ImportError as _e:
     STT_AVAILABLE = False
     _stt_import_error = str(_e)
+
+
+# ---------------------------------------------------------------------------
+# LCD status display
+# ---------------------------------------------------------------------------
+
+LCD_IMAGES_DIR = os.getenv("LCD_IMAGES_DIR", os.path.join(os.path.dirname(__file__), "cartoons"))
+
+_STATUS_IMAGES = {
+    "listening":   "hello_g.png",   # Green  = mic open, user can speak
+    "speaking":    "hello_r.png",   # Red    = TTS playing
+    "calibrating": "hello_y.png",   # Yellow = STT noise calibration
+    "ready":       "hello.png",     # White  = idle
+}
+
+try:
+    from MangDang.LCD.ST7789 import ST7789 as _ST7789
+    from PIL import Image as _LCDImage
+    _lcd = _ST7789()
+    _lcd.begin()
+    _LCD_AVAILABLE = True
+except Exception as _lcd_err:
+    _LCD_AVAILABLE = False
+    _lcd = None
+    logging.getLogger(__name__).warning(f"LCD not available: {_lcd_err}")
+
+
+def show_status_image(status: str) -> None:
+    """Display a colour-coded status image on the ST7789 LCD.
+
+    Statuses: 'listening' (green), 'speaking' (red),
+              'calibrating' (yellow), 'ready' (white).
+    Silently does nothing if the LCD hardware is not present.
+    """
+    if not _LCD_AVAILABLE or _lcd is None:
+        return
+    filename = _STATUS_IMAGES.get(status)
+    if not filename:
+        return
+    try:
+        image = _LCDImage.open(os.path.join(LCD_IMAGES_DIR, filename))
+        _lcd.display(image)
+    except Exception as e:
+        logging.getLogger(__name__).error(f"LCD show_status_image('{status}') failed: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -197,6 +242,7 @@ class NoiseRobustSTT:
 
     def calibrate_noise(self, stream) -> None:
         """Capture 2 s of ambient noise to set the silence threshold."""
+        show_status_image("calibrating")
         print("\n" + "=" * 60)
         print("Calibrating noise — please stay silent for 2 seconds...")
         print("=" * 60)
@@ -217,17 +263,24 @@ class NoiseRobustSTT:
         print(f"\nCalibration done. RMS={noise_rms:.0f}, threshold={self.silence_threshold:.0f}, gain={self.input_gain}x")
         print("=" * 60 + "\n")
         logging.info(f"Calibration done. RMS={noise_rms:.0f}, threshold={self.silence_threshold:.0f}")
+        show_status_image("ready")
 
-    def listen_once(self, stream) -> tuple[str | None, str | None]:
+    def listen_once(self, stream, tts_active=None) -> tuple[str | None, str | None]:
         """
         Block until one complete utterance is captured.
         Returns (transcript, detected_language_code) or (None, None).
+
+        tts_active: optional threading.Event — when set, TTS is playing.
+        The loop pauses and discards any in-progress capture until it clears.
         """
-        self.accumulated_audio = []
-        self.ring_buffer = []
-        self.consecutive_silent_frames = 0
-        self.consecutive_speech_frames = 0
-        self.is_currently_speaking = False
+        def _reset_state():
+            self.accumulated_audio = []
+            self.ring_buffer = []
+            self.consecutive_silent_frames = 0
+            self.consecutive_speech_frames = 0
+            self.is_currently_speaking = False
+
+        _reset_state()
         speech_detected = False
 
         max_iterations = int(30 * self.sample_rate / self.chunk_size)
@@ -235,6 +288,22 @@ class NoiseRobustSTT:
 
         for iteration in range(max_iterations):
             try:
+                # Pause STT capture while TTS is playing to avoid feedback loop
+                if tts_active is not None and tts_active.is_set():
+                    _reset_state()
+                    speech_detected = False
+                    print("\r  [STT paused — waiting for TTS to finish]    ", end="", flush=True)
+                    # Wait until TTS finishes (event is cleared, not set)
+                    while tts_active.is_set():
+                        time.sleep(0.05)
+                    print("\r  [STT resumed]                                 ", end="", flush=True)
+                    # drain any buffered mic audio that built up during TTS
+                    try:
+                        stream.read(self.chunk_size * 10, exception_on_overflow=False)
+                    except Exception:
+                        pass
+                    return None, None  # restart listen_once cleanly
+
                 data = stream.read(self.chunk_size, exception_on_overflow=False)
                 audio_data = self._apply_gain(np.frombuffer(data, dtype=np.int16))
                 cleaned = self._reduce_noise(audio_data)
@@ -277,6 +346,7 @@ class NoiseRobustSTT:
                 if (self.is_currently_speaking
                         and self.consecutive_silent_frames >= self.num_silent_frames_threshold):
                     print("\n  [processing...]", flush=True)
+                    show_status_image("ready")
                     if not self.accumulated_audio:
                         return None, None
 
@@ -289,9 +359,11 @@ class NoiseRobustSTT:
 
             except Exception as e:
                 logging.error(f"listen_once error: {e}")
+                show_status_image("ready")
                 return None, None
 
         print("\n  [timeout — no speech in 30 s]", flush=True)
+        show_status_image("ready")
         return None, None
 
     def _push_ring(self, frame):
@@ -330,12 +402,16 @@ class NoiseRobustSTT:
 
             if response.results and response.results[0].alternatives:
                 alt = response.results[0].alternatives[0]
+                transcript = alt.transcript.strip()
+                if not transcript:
+                    logging.warning("Empty transcript returned (confidence=0%) — treating as no speech")
+                    return None, None
                 try:
                     detected_lang = response.results[0].language_code or self.language_code
                 except Exception:
                     detected_lang = self.language_code
-                logging.info(f"Transcript: '{alt.transcript}' ({alt.confidence:.0%}, lang={detected_lang})")
-                return alt.transcript, detected_lang
+                logging.info(f"Transcript: '{transcript}' ({alt.confidence:.0%}, lang={detected_lang})")
+                return transcript, detected_lang
 
             logging.warning("No transcript returned — audio may be too quiet or unclear")
             return None, None
@@ -343,6 +419,86 @@ class NoiseRobustSTT:
         except Exception as e:
             logging.error(f"Transcription error: {e}")
             return None, None
+
+
+# ---------------------------------------------------------------------------
+# Language detection for TTS voice selection
+# ---------------------------------------------------------------------------
+
+# Google Cloud TTS voice names for non-English languages.
+# Override any entry via env vars: e.g. VOICE_CHINESE=cmn-CN-Wavenet-B
+LANG_VOICES: dict[str, str] = {
+    "Japanese":  os.getenv("VOICE_JAPANESE",  "ja-JP-Neural2-B"),
+    "Chinese":   os.getenv("VOICE_CHINESE",   "cmn-CN-Wavenet-A"),
+    "Korean":    os.getenv("VOICE_KOREAN",    "ko-KR-Neural2-A"),
+    "French":    os.getenv("VOICE_FRENCH",    "fr-FR-Standard-C"),
+    "German":    os.getenv("VOICE_GERMAN",    "de-DE-Neural2-D"),
+    "Spanish":   os.getenv("VOICE_SPANISH",   "es-US-Wavenet-A"),
+    "Italian":   os.getenv("VOICE_ITALIAN",   "it-IT-Standard-B"),
+    "Hebrew":    os.getenv("VOICE_HEBREW",    "he-IL-Standard-A"),
+    "Cantonese": os.getenv("VOICE_CANTONESE", "yue-HK-Standard-C"),
+}
+
+
+def detect_lang_name(text: str) -> str | None:
+    """Return the LANG_VOICES key for the dominant non-English script in *text*, or None."""
+    def _any(lo: int, hi: int) -> bool:
+        return any(lo <= ord(c) <= hi for c in text)
+
+    if _any(0x3040, 0x309F) or _any(0x30A0, 0x30FF):   # Hiragana / Katakana
+        return "Japanese"
+    if _any(0xAC00, 0xD7AF):                             # Hangul syllables
+        return "Korean"
+    if _any(0x05D0, 0x05EA):                             # Hebrew
+        return "Hebrew"
+    if _any(0x4E00, 0x9FFF) or _any(0x3400, 0x4DBF):   # CJK unified ideographs
+        return "Chinese"
+    return None
+
+
+# Maps the primary language subtag from a BCP-47 code to a LANG_VOICES key.
+_LANG_CODE_PREFIX: dict[str, str] = {
+    "ja":  "Japanese",
+    "cmn": "Chinese",
+    "zh":  "Chinese",
+    "ko":  "Korean",
+    "fr":  "French",
+    "de":  "German",
+    "es":  "Spanish",
+    "it":  "Italian",
+    "he":  "Hebrew",
+    "yue": "Cantonese",
+}
+
+
+def detect_lang_name_from_code(lang_code: str) -> str | None:
+    """Return the LANG_VOICES key for a BCP-47 language code, or None for English/unknown."""
+    if not lang_code:
+        return None
+    prefix = lang_code.split("-")[0].lower()
+    return None if prefix == "en" else _LANG_CODE_PREFIX.get(prefix)
+
+
+def detect_lang_name_from_text_or_code(text: str, lang_code: str | None = None) -> str | None:
+    """Detect language via Unicode script first, then fall back to the STT lang code.
+
+    Unicode detection is reliable for CJK / kana / Hangul / Hebrew.
+    The STT lang code covers Latin-script languages (French, German, Spanish …).
+    Returns None for English or unrecognised languages.
+    """
+    return detect_lang_name(text) or detect_lang_name_from_code(lang_code or "")
+
+
+def detect_voice_for_text(text: str, default_voice: str) -> str:
+    """Return the TTS voice name best suited for the script in *text*.
+
+    Uses Unicode block ranges — reliable for CJK / kana / Hangul / Hebrew.
+    Falls back to *default_voice* for Latin-script languages.
+    """
+    lang = detect_lang_name(text)
+    if lang and lang in LANG_VOICES:
+        return LANG_VOICES[lang]
+    return default_voice
 
 
 # ---------------------------------------------------------------------------

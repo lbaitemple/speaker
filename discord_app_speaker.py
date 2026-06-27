@@ -20,6 +20,8 @@ Environment variables:
 - LANGUAGE_CODE        : STT recognition language (default: en-US)
 - STT_INPUT_GAIN       : software mic gain multiplier (default: 3.0)
 - DEBUG_LOG            : set to 1 for verbose debug output
+- LCD_IMAGES_DIR       : path to directory containing hello*.png LCD images
+                         (default: /home/ubuntu/apps-md-robots/cartoons)
 """
 
 from __future__ import annotations
@@ -28,14 +30,19 @@ import asyncio
 import logging
 import os
 import re
+import signal
+import subprocess
 import threading
-from queue import Queue
+import time
+from queue import Queue, Empty
 from pathlib import Path
 
 import discord
 from dotenv import load_dotenv
 
-from speechutil import GoogleTTS, NoiseRobustSTT, STT_AVAILABLE
+from speechutil import (GoogleTTS, NoiseRobustSTT, STT_AVAILABLE, show_status_image,
+                        detect_voice_for_text, detect_lang_name,
+                        detect_lang_name_from_text_or_code)
 
 
 # Fixed defaults for this workflow; env vars override these defaults.
@@ -132,10 +139,13 @@ def stt_discord_loop(
     lang_code: str,
     input_gain: float,
     prompt_initiation: str = FIXED_PROMPT_INITIATION,
+    tts_active: threading.Event | None = None,
 ) -> None:
     """
     Background thread: captures microphone speech with NoiseRobustSTT and
     queues each transcription for the connected Discord client to post.
+
+    tts_active: when set, listen_once will pause to avoid capturing TTS output.
     """
     if not STT_AVAILABLE:
         from speechutil import _stt_import_error
@@ -158,15 +168,20 @@ def stt_discord_loop(
     print("STT ready — speak to send messages to Discord.")
 
     while True:
+        # Don't show green or start listening while TTS is playing
+        if tts_active is not None:
+            while tts_active.is_set():
+                time.sleep(0.05)
+        show_status_image("listening")
         print("Listening... (speak now)", flush=True)
-        transcript, _lang = stt.listen_once(stream)
+        transcript, stt_lang = stt.listen_once(stream, tts_active=tts_active)
         if not transcript:
             print("(no speech detected, listening again...)", flush=True)
             continue
 
-        print(f"\nYou: {transcript}", flush=True)
+        print(f"\nYou [{stt_lang or '?'}]: {transcript}", flush=True)
 
-        outbound_queue.put((channel_id, transcript, prompt_initiation))
+        outbound_queue.put((channel_id, transcript, prompt_initiation, stt_lang))
 
 
 # ---------------------------------------------------------------------------
@@ -209,6 +224,14 @@ class DiscordAppSpeaker(discord.Client):
         self._speech_task: asyncio.Task | None = None
         self._stt_post_task: asyncio.Task | None = None
         self._event_loop: asyncio.AbstractEventLoop | None = None
+        # Set while TTS is playing so the STT thread pauses and avoids capturing agent speech
+        self._tts_active = threading.Event()
+        # Non-English language currently active (e.g. "Chinese"); None means English
+        self._active_lang: str | None = None
+        # True after user switches back to English; cleared once Hermes confirms
+        # by actually replying in English.  Keeps "Please reply in English."
+        # appended on every STT post until the switch takes effect.
+        self._returning_to_english: bool = False
 
     def _log(self, msg: str) -> None:
         if self.debug:
@@ -227,6 +250,7 @@ class DiscordAppSpeaker(discord.Client):
 
     async def on_ready(self) -> None:
         self._event_loop = asyncio.get_running_loop()
+        await asyncio.to_thread(show_status_image, "ready")
 
         print(f"Logged in as {self.user} ({self.user.id})")
         print(f"Watching user IDs: {sorted(self.target_app_user_ids)}")
@@ -249,9 +273,15 @@ class DiscordAppSpeaker(discord.Client):
             if not post_channel:
                 print("Warning: STT_ENABLED=1 but no channel configured — STT disabled")
             else:
+                ok = await self.post_to_channel(self.prompt_initiation, post_channel)
+                if ok:
+                    print(f"Sent initiation '{self.prompt_initiation}' to channel {post_channel}")
+                else:
+                    print(f"Failed to send initiation to channel {post_channel} — check bot permissions")
                 threading.Thread(
                     target=stt_discord_loop,
                     args=(self._stt_outbound_queue, post_channel, self.lang_code, self.input_gain, self.prompt_initiation),
+                    kwargs={"tts_active": self._tts_active},
                     daemon=True,
                 ).start()
                 print(f"STT input thread started — posting to channel {post_channel}")
@@ -269,8 +299,20 @@ class DiscordAppSpeaker(discord.Client):
             self._log(f"Skipped empty message id={message.id}")
             return
 
-        voice = self.user_voices.get(message.author.id, self.tts.default_voice)
-        print(f"Bot: {text}\n", flush=True)
+        # Pick TTS voice from the message content.
+        # _active_lang is NOT modified here — it is driven solely by the user's
+        # speech in _stt_post_worker, so Hermes replying in a language doesn't
+        # re-lock the conversation after the user has explicitly switched away.
+        detected = detect_lang_name(text)
+        if detected:
+            voice = detect_voice_for_text(text, self.tts.default_voice)
+        else:
+            # Hermes replied in English — language switch confirmed, stop reminding.
+            if self._returning_to_english:
+                print("[lang] Hermes confirmed English — language switch complete", flush=True)
+                self._returning_to_english = False
+            voice = self.user_voices.get(message.author.id, self.tts.default_voice)
+        print(f"Bot [{voice}]: {text}\n", flush=True)
         await self._speech_queue.put((text, voice))
 
     # ------------------------------------------------------------------
@@ -281,23 +323,56 @@ class DiscordAppSpeaker(discord.Client):
         while True:
             text, voice = await self._speech_queue.get()
             try:
+                self._tts_active.set()   # pause STT while speaking
+                await asyncio.to_thread(show_status_image, "speaking")
                 await self.tts.speak(text, voice)
             except Exception as e:
                 logging.error(f"TTS error: {e}")
             finally:
+                self._tts_active.clear()  # resume STT
+                await asyncio.to_thread(show_status_image, "ready")
                 self._speech_queue.task_done()
 
     async def _stt_post_worker(self) -> None:
         while True:
-            channel_id, transcript, prompt_initiation = await asyncio.to_thread(self._stt_outbound_queue.get)
             try:
-                initiation = (prompt_initiation or FIXED_PROMPT_INITIATION).strip()
+                # Timeout keeps the executor thread short-lived so Ctrl+C can
+                # drain the thread pool and exit cleanly within ~1 second.
+                channel_id, transcript, _prompt_initiation, stt_lang = await asyncio.to_thread(
+                    self._stt_outbound_queue.get, True, 1.0
+                )
+            except Empty:
+                continue
+            except asyncio.CancelledError:
+                break
+            try:
                 transcript_text = transcript.strip()
-
-                if initiation:
-                    await self.post_to_channel(initiation, channel_id)
-
                 if transcript_text:
+                    # Detect language from what the USER actually said.
+                    # Unicode script detection handles CJK/kana/Hangul/Hebrew;
+                    # STT lang code covers Latin-script languages (fr, de, es …).
+                    user_lang = detect_lang_name_from_text_or_code(transcript_text, stt_lang)
+                    if user_lang:
+                        # User switched to (or is continuing in) a non-English language.
+                        if self._active_lang != user_lang:
+                            print(f"[lang] {self._active_lang or 'English'} → {user_lang}", flush=True)
+                        self._active_lang = user_lang
+                        self._returning_to_english = False
+                    elif self._active_lang:
+                        # No non-English script detected.
+                        # STT returning "en-*" is a direct signal; ≥3-word
+                        # transcript without STT code is the fallback.
+                        stt_english = (stt_lang or "").startswith("en")
+                        if stt_english or len(transcript_text.split()) >= 3:
+                            print(f"[lang] {self._active_lang} → English", flush=True)
+                            self._active_lang = None
+                            self._returning_to_english = True
+
+                    if self._active_lang:
+                        transcript_text += f", Please reply in {self._active_lang}."
+                    elif self._returning_to_english:
+                        # Keep reminding Hermes until it actually replies in English.
+                        transcript_text += ", Please reply in English."
                     await self.post_to_channel(transcript_text, channel_id)
             except Exception as e:
                 logging.error(f"Failed to post STT transcript to Discord: {e}")
@@ -345,14 +420,16 @@ class DiscordAppSpeaker(discord.Client):
     # Helpers called from threads
     # ------------------------------------------------------------------
 
-    async def post_to_channel(self, text: str, channel_id: int) -> None:
-        """Send a text message to a Discord channel (safe to call from any thread)."""
+    async def post_to_channel(self, text: str, channel_id: int) -> bool:
+        """Send a text message to a Discord channel. Returns True on success."""
         try:
             channel = self.get_channel(channel_id) or await self.fetch_channel(channel_id)
             await channel.send(text)
             self._log(f"Posted to channel {channel_id}: {text}")
+            return True
         except Exception as e:
             logging.error(f"post_to_channel error: {e}")
+            return False
 
 
 # ---------------------------------------------------------------------------
@@ -399,20 +476,54 @@ async def async_main() -> None:
             await client.close()
 
 
+def _kill_previous_instances() -> None:
+    """Kill any other running copies of this script so they release the audio device."""
+    current_pid = os.getpid()
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", "discord_app_speaker.py"],
+            capture_output=True, text=True,
+        )
+        others = [int(p) for p in result.stdout.split() if p.strip() and int(p) != current_pid]
+        if not others:
+            return
+        print(f"[startup] Killing previous instance(s): PIDs {others}", flush=True)
+        for pid in others:
+            try:
+                os.kill(pid, signal.SIGKILL)
+                print(f"[startup] Sent SIGKILL to PID {pid}", flush=True)
+            except ProcessLookupError:
+                print(f"[startup] PID {pid} already gone", flush=True)
+            except PermissionError:
+                print(f"[startup] No permission to kill PID {pid} — try sudo", flush=True)
+        time.sleep(1)  # Wait for audio device to be released
+    except Exception as e:
+        print(f"[startup] Could not check for previous instances: {e}", flush=True)
+
+
 def main() -> None:
     logging.basicConfig(
         format="%(asctime)s %(levelname)s [%(filename)s:%(lineno)d] %(message)s",
         level=logging.INFO,
     )
+    _kill_previous_instances()
     print("[startup] Setting PCM volume...")
     os.system("amixer -c 0 sset 'PCM' 100% >/dev/null 2>&1")
+    _restart = True
     try:
         print("[startup] Initializing Google TTS + Discord client...")
         asyncio.run(async_main())
-    except KeyboardInterrupt:
-        print("Stopped.")
     except discord.LoginFailure:
         print("Discord login failed — check DISCORD_BOT_TOKEN in .env")
+        _restart = False
+    except Exception as e:
+        logging.error(f"Fatal error: {e}")
+    finally:
+        if _restart:
+            print("[shutdown] Restarting robot.service...")
+            # Ignore further Ctrl+C while the restart command runs
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+            os.system("sudo systemctl restart robot.service")
 
 
 if __name__ == "__main__":
