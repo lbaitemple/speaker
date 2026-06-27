@@ -19,8 +19,15 @@ sudo   apt install python3.12-venv libgl1  portaudio19-dev  python3-pyaudio -y
 python3 -m venv "$VENV"
 
 source "$VENV/bin/activate"
-
 "$VENV/bin/pip" install --upgrade pip
+
+
+cd /home/ubuntu/mini_pupper_bsp/Python_Module
+"$VENV/bin/pip" install -r "./requirements.txt"
+
+"$VENV/bin/pip" install .
+
+
 "$VENV/bin/pip" install -r "$SCRIPT_DIR/requirements.txt"
 
 
