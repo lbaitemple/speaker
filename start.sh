@@ -14,6 +14,7 @@ fi
 
 # Install / update Python dependencies
 echo "[setup] Installing requirements..."
+sudo apt update 
  sudo   apt install python3.12-venv  portaudio19-dev  python3-pyaudio -y
 python3 -m venv "$VENV"
 
