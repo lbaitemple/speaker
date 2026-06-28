@@ -16,6 +16,7 @@ fi
 echo "[setup] Installing requirements..."
 sudo apt update
 sudo   apt install python3.12-venv  portaudio19-dev  python3-pyaudio -y
+python3 -m venv "$VENV"
 "$VENV/bin/pip" install --quiet -r "$SCRIPT_DIR/requirements.txt"
 cp "$SCRIPT_DIR/pyvenv.cfg" "$CFG"
 
