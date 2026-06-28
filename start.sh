@@ -5,11 +5,16 @@ set -o pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV="$SCRIPT_DIR/.venv"
 CFG="$VENV/pyvenv.cfg"
+CRED="/home/ubuntu/minipupper_creds.json"
 
 # Allow the venv to see system-installed packages (e.g. MangDang LCD)
 if [ -f "$CFG" ]; then
     sed -i 's/^include-system-site-packages = false/include-system-site-packages = true/' "$CFG"
     echo "[setup] include-system-site-packages = true"
+fi
+
+if [ -f "$CRED" ]; then
+  cp "$CRED" "$SCRIPT_DIR/creds.json"
 fi
 
 # Install / update Python dependencies
