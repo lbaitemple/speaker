@@ -14,15 +14,8 @@ fi
 
 # Install / update Python dependencies
 echo "[setup] Installing requirements..."
-sudo apt update 
-sudo   apt install python3.12-venv libgl1  portaudio19-dev  python3-pyaudio -y
-python3 -m venv "$VENV"
-
-"$VENV/bin/pip" install --upgrade pip
-
-
-"$VENV/bin/pip" install -r "$SCRIPT_DIR/requirements.txt"
-
+ sudo   apt install python3.12-venv  portaudio19-dev  python3-pyaudio -y
+"$VENV/bin/pip" install --quiet -r "$SCRIPT_DIR/requirements.txt"
 
 # Kill any previous instance so it releases the audio device before we start
 if pkill -f "discord_app_speaker.py" 2>/dev/null; then
