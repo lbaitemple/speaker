@@ -104,6 +104,7 @@ def env_user_voices(name: str, default_voice: str) -> dict[int, str]:
 
 def clean_text(text: str) -> str:
     text = re.sub(r"<@!?\d+>", "", text)
+    text = re.sub(r"\btechOWL\b", "tech Owl", text, flags=re.IGNORECASE)
     return re.sub(r"\s+", " ", text).strip()
 
 
